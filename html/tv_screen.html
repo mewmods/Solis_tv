@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- A pagina é servida pelo proprio recurso (cfx-nui-...). O video e o
+         audio sao reproduzidos diretamente pelo player do YouTube. -->
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <title>Solis TV Player</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+        }
+        #host, #host iframe {
+            width: 100%;
+            height: 100%;
+            border: 0;
+            display: block;
+        }
+        #boot {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #7d8590;
+            font: 500 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="host"></div>
+    <div id="boot">Solis TV</div>
+
+    <script>
+    /* tv_screen.html — player DUI local do solis_tv.
+       Recebe do Lua:   { action:'sync', id, v, t, vol, playing, speed, cc }
+       Envia ao Lua:    { ev:'ready'|'state'|'ended'|'error'|'time', id, ... }
+       Os eventos voltam por POST em /tvDuiEvent (callback registrado no client). */
+    (function () {
+        'use strict';
+
+        var params = new URLSearchParams(location.search);
+        var resource = params.get('r') || '';
+        var tvId = params.get('id') || '';
+
+        var state = {
+            videoId: params.get('v') || '',
+            t: parseInt(params.get('t') || '0', 10) || 0,
+            vol: clamp(parseInt(params.get('vol') || '50', 10)),
+            playing: params.get('autoplay') === '1',
+            speed: parseFloat(params.get('speed') || '1') || 1,
+            cc: params.get('cc') === '1'
+        };
+
+        var player = null;
+        var ready = false;
+        var attempts = 0;
+        var endSent = false;
+        var timer = null;
+        var apiPromise = null;
+        var host = document.getElementById('host');
+
+        function clamp(value) {
+            value = Number(value);
+            if (!isFinite(value)) return 50;
+            return Math.max(0, Math.min(100, Math.round(value)));
+        }
+
+        /* ---------- callback de volta para o cliente ---------- */
+        // Em DUI https o host é cfx-nui-<resource>; com nui:// ele é <resource>.
+        // Tentar os dois formatos cobre os dois esquemas sem depender de Worker.
+        function buildBases() {
+            var seen = {};
+            var list = [];
+
+            function add(value) {
+                if (!value || seen[value]) return;
+                seen[value] = true;
+                list.push(value);
+            }
+
+            var hostname = location.hostname || '';
+            if (hostname) add('https://' + hostname + '/');
+            if (resource) {
+                add('https://' + resource + '/');
+                add('https://cfx-nui-' + resource + '/');
+            }
+            if (!list.length) add('https://cfx-nui-solis_tv/');
+            return list;
+        }
+
+        var bases = buildBases();
+        var workingBase = 0;
+
+        function post(ev, extra) {
+            var payload = { ev: ev, id: tvId };
+            if (extra) {
+                for (var key in extra) {
+                    if (Object.prototype.hasOwnProperty.call(extra, key)) payload[key] = extra[key];
+                }
+            }
+
+            var body = JSON.stringify(payload);
+
+            function sendAt(index) {
+                if (index >= bases.length) return;
+
+                try {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', bases[index] + 'tvDuiEvent', true);
+                    xhr.setRequestHeader('Content-Type', 'application/json');
+                    xhr.onreadystatechange = function () {
+                        if (xhr.readyState !== 4) return;
+                        if ((xhr.status >= 200 && xhr.status < 300) || xhr.status === 0) {
+                            workingBase = index;
+                        } else {
+                            sendAt(index + 1);
+                        }
+                    };
+                    xhr.onerror = function () { sendAt(index + 1); };
+                    xhr.send(body);
+                } catch (e) {
+                    sendAt(index + 1);
+                }
+            }
+
+            sendAt(workingBase);
+        }
+
+        /* ---------- YouTube IFrame API ---------- */
+        function loadApi() {
+            if (window.YT && window.YT.Player) return Promise.resolve();
+            if (apiPromise) return apiPromise;
+
+            apiPromise = new Promise(function (resolve) {
+                var previous = window.onYouTubeIframeAPIReady;
+
+                window.onYouTubeIframeAPIReady = function () {
+                    if (typeof previous === 'function') previous();
+                    resolve();
+                };
+
+                var tag = document.createElement('script');
+                tag.src = 'https://www.youtube.com/iframe_api';
+                tag.async = true;
+                tag.onerror = function () {
+                    apiPromise = null;
+                    resolve();
+                };
+                document.head.appendChild(tag);
+            });
+
+            return apiPromise;
+        }
+
+        function currentTime() {
+            if (!player || typeof player.getCurrentTime !== 'function') return 0;
+            try { return player.getCurrentTime() || 0; } catch (e) { return 0; }
+        }
+
+        function applyVolume() {
+            if (!ready || !player) return;
+            try {
+                player.setVolume(state.vol);
+                if (state.vol > 0) player.unMute();
+                else player.mute();
+            } catch (e) { }
+        }
+
+        function applySpeed() {
+            if (!ready || !player || typeof player.setPlaybackRate !== 'function') return;
+            try { player.setPlaybackRate(state.speed); } catch (e) { }
+        }
+
+        function applyCC() {
+            if (!ready || !player || typeof player.loadModule !== 'function') return;
+            try { player.loadModule('cc', state.cc); } catch (e) { }
+        }
+
+        function applyPlayback() {
+            if (!ready || !player) return;
+            try {
+                if (state.playing) player.playVideo();
+                else player.pauseVideo();
+            } catch (e) { }
+        }
+
+        function seekTo(seconds) {
+            if (!ready || !player || typeof player.seekTo !== 'function') return;
+            try { player.seekTo(Math.max(0, Math.floor(seconds)), true); } catch (e) { }
+        }
+
+        function startTimer() {
+            if (timer) clearInterval(timer);
+            timer = setInterval(function () {
+                if (!ready || !player) return;
+                var duration = 0;
+                try { duration = player.getDuration() || 0; } catch (e) { }
+
+                post('time', {
+                    time: Math.floor(currentTime()),
+                    duration: Math.floor(duration)
+                });
+            }, 3000);
+        }
+
+        function createPlayer() {
+            if (!state.videoId) return;
+
+            attempts++;
+            ready = false;
+            endSent = false;
+
+            if (timer) { clearInterval(timer); timer = null; }
+            if (player && typeof player.destroy === 'function') {
+                try { player.destroy(); } catch (e) { }
+            }
+            player = null;
+
+            host.innerHTML = '<div></div>';
+            var boot = document.getElementById('boot');
+            if (boot) boot.style.display = 'none';
+
+            player = new window.YT.Player(host.firstChild, {
+                host: 'https://www.youtube.com',
+                videoId: state.videoId,
+                width: '100%',
+                height: '100%',
+                playerVars: {
+                    autoplay: state.playing ? 1 : 0,
+                    controls: 0,
+                    disablekb: 1,
+                    fs: 0,
+                    rel: 0,
+                    showinfo: 0,
+                    iv_load_policy: 3,
+                    modestbranding: 1,
+                    playsinline: 1,
+                    enablejsapi: 1,
+                    // origin/widget_referrer evitam o Error 153 em WebViews.
+                    origin: 'https://www.youtube.com',
+                    widget_referrer: 'https://www.youtube.com'
+                },
+                events: {
+                    onReady: function () {
+                        ready = true;
+                        applyVolume();
+                        applySpeed();
+                        applyCC();
+                        if (state.t > 0) seekTo(state.t);
+                        applyPlayback();
+
+                        var duration = 0;
+                        try { duration = player.getDuration() || 0; } catch (e) { }
+                        post('ready', {
+                            duration: Math.floor(duration),
+                            time: Math.floor(currentTime())
+                        });
+                        startTimer();
+                    },
+
+                    onStateChange: function (event) {
+                        var code = event && event.data;
+                        if (code === 1 || code === 3) endSent = false;
+
+                        var duration = 0;
+                        try { duration = player.getDuration() || 0; } catch (e) { }
+
+                        post('state', {
+                            state: code,
+                            duration: Math.floor(duration),
+                            time: Math.floor(currentTime())
+                        });
+
+                        if (code === 0 && !endSent) {
+                            endSent = true;
+                            post('ended', { duration: Math.floor(duration) });
+                        }
+                    },
+
+                    onError: function (event) {
+                        var code = event && event.data;
+
+                        // 153 é intermitente na primeira criação. Recriar o
+                        // player costuma resolver antes do fallback da DUI.
+                        if (code === 153 && attempts < 4) {
+                            setTimeout(createPlayer, 700 * attempts);
+                            return;
+                        }
+
+                        post('error', { code: code });
+                    }
+                }
+            });
+        }
+
+        /* ---------- mensagens enviadas pelo SendDuiMessage do Lua ---------- */
+        function parseMessage(data) {
+            if (typeof data === 'string') {
+                try { return JSON.parse(data); } catch (e) { return null; }
+            }
+            return data && typeof data === 'object' ? data : null;
+        }
+
+        function applySync(msg) {
+            var nextVideo = String(msg.v || '');
+            if (!nextVideo) return;
+
+            var changed = nextVideo !== state.videoId;
+            state.videoId = nextVideo;
+            state.t = Math.max(0, Math.floor(Number(msg.t) || 0));
+            state.vol = (typeof msg.vol === 'number') ? clamp(msg.vol) : state.vol;
+            state.speed = Number(msg.speed) || state.speed;
+            state.cc = msg.cc === true;
+            state.playing = msg.playing === true;
+
+            if (changed) {
+                createPlayer();
+                return;
+            }
+
+            if (!ready) return;
+
+            applyVolume();
+            applySpeed();
+            applyCC();
+
+            var actual = currentTime();
+            if (state.t > 0 && Math.abs(actual - state.t) > 2) {
+                endSent = false;
+                seekTo(state.t);
+            } else if (state.t === 0 && actual > 3) {
+                endSent = false;
+                seekTo(0);
+            }
+
+            var code = -1;
+            try { code = player.getPlayerState(); } catch (e) { }
+            if (state.playing && code !== 1 && code !== 3) {
+                try { player.playVideo(); } catch (e) { }
+            } else if (!state.playing && code !== 2) {
+                try { player.pauseVideo(); } catch (e) { }
+            }
+        }
+
+        window.addEventListener('message', function (event) {
+            var data = parseMessage(event.data);
+            if (!data) return;
+
+            if (data.action === 'sync') {
+                applySync(data);
+                return;
+            }
+
+            // Compatibilidade com comandos simples, caso a pagina seja aberta
+            // diretamente durante um teste manual.
+            if (data.action === 'play') { state.playing = true; applyPlayback(); }
+            else if (data.action === 'pause') { state.playing = false; applyPlayback(); }
+            else if (data.action === 'seek') { seekTo(Number(data.time) || 0); }
+            else if (data.action === 'volume') { state.vol = clamp(data.value); applyVolume(); }
+        });
+
+        if (window.YT && window.YT.Player) {
+            createPlayer();
+        } else {
+            loadApi().then(function () {
+                if (window.YT && window.YT.Player) createPlayer();
+                else post('error', { code: -1 });
+            });
+        }
+    })();
+    </script>
+</body>
+</html>
